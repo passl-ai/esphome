@@ -1,0 +1,345 @@
+substitutions:
+  # config of temp sensor ids
+  heating_ip: !secret heating_ip
+  temp_sensor1_id: sensor.eta_${heating_ip}_pufferflex_eingange_fuhler_1_oben
+  temp_sensor2_id: sensor.eta_${heating_ip}_pufferflex_eingange_fuhler_2
+
+  temp_limit: '85'  # in °C
+  time_limit_unchanged: '10'  # in s, limit for meter reading to remain unchanged before turning off rod
+  
+  # 50 Hz -> 50 full sinus waves -> 100 half waves = on/off points at zero crossing within 1s
+  # assumption: smartmeter integrating at 5Hz -> buckets of 200ms -> 20 levels -> 5% per step
+  # PROD: total power of coil: 1.5kW -> 75W per step
+  levels: '20'
+  integration_time_meter: '0.2s'  # integration of meter is assumed to be 5Hz -> 0.2s
+  relative_step_size: '0.05'
+
+  #absolute_step_size: '75'  # in W; = $relative_step_size * $max_power_rod -> PROD rod: 75W
+  #threshold_factor: '0.5'  #TODO: remove or incorporate
+
+
+esphome:
+  name: diff-boiler
+  friendly_name: diff_boiler
+  on_boot:
+    priority: -10
+    then:
+      - script.execute: turn_off_ssr
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret enc_key_boiler
+
+ota:
+  platform: esphome
+  password: !secret ota_pw_boiler
+
+wifi:
+  networks:
+  - ssid: !secret wifi_ssid
+    password: !secret wifi_password
+    manual_ip:
+      static_ip: !secret static_ip_boiler
+      gateway: !secret gateway
+      subnet: 255.255.255.0
+  #- ssid: !secret wifi_ssid_ext
+  #  password: !secret wifi_password_ext
+  #  manual_ip:
+  #    static_ip: !secret static_ip_boiler_ext
+  #    gateway: !secret gateway_ext
+  #    subnet: 255.255.255.0
+
+  on_connect:
+    - logger.log: "wifi connected"
+  on_disconnect:
+    - logger.log: "wifi disconnected, turning relay off"
+    - script.execute: turn_off_ssr
+
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+
+    on_time_sync: 
+      then:
+        - logger.log:
+            format: "time is %d"
+            args: ["id(homeassistant_time).now().timestamp"]
+
+    # check every $time_limit_unchanged seconds whether smartmeter reader is updating
+    on_time:
+      - seconds: /$time_limit_unchanged
+        then:
+          - if:
+              condition:
+                lambda: "return (id(homeassistant_time).now().is_valid());"
+              then:
+                - if:
+                    condition:
+                      - lambda: 
+                          "return ((id(homeassistant_time).now().timestamp) - (id(last_updated)) > $time_limit_unchanged);"
+                    then:
+                      - script.execute: turn_off_ssr
+                      - logger.log: "Turned off due to smartmeter reading not changing for $time_limit_unchanged s. Will resume..."
+              else:
+                - script.execute: turn_off_ssr
+
+deep_sleep:
+  id: deep_sleep_1
+  touch_wakeup: True
+
+sun:
+  id: sun_component
+  latitude: !secret latitude
+  longitude: !secret longitude
+  on_sunset: 
+    then:
+      - script.execute: turn_off_ssr
+      - logger.log: "sunset"
+      - if:
+          condition:
+            lambda: 'return id(deepsleep_switch).state = "on";'
+          then:
+            - logger.log: "deepsleep switch is on"
+            - if:
+                condition:
+                  time.has_time:
+                then:
+                  - logger.log: "DeepSleep switch is on, time is valid. Going to sleep."
+                  - deep_sleep.enter:
+                      id: deep_sleep_1
+                      sleep_duration: !lambda 'return id(sun_component).sunrise(0).value().timestamp - id(homeassistant_time).now().timestamp;'
+
+globals:
+  - id: pwm_lvl
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_updated
+    type: int
+    restore_value: no
+
+output:
+  - platform: slow_pwm
+    pin: GPIO13
+    id: ssr_control
+    period: $integration_time_meter 
+
+switch:
+  - platform: output
+    name: "Heizstab an"
+    id: coil_switch
+    icon: "mdi:restart"
+    output: ssr_control
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on: 
+      then:
+        - script.execute: turn_off_ssr #name misleading but resets to avoid voltage peak
+    on_turn_off: 
+      then:
+        - script.execute: turn_off_ssr #resets to avoid voltage peak
+  - platform: template
+    name: "DeepSleep in der Nacht"
+    id: deepsleep_switch
+    icon: "mdi:power-sleep"
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: True
+
+number:
+  # max power rod only as config for potential homeassistant helper for consumption integration
+  - platform: template
+    name: Max. Power Rod
+    id: max_power_rod
+    initial_value: 1.5
+    max_value: 3.0
+    min_value: 0.1
+    step: 0.1
+    optimistic: true
+    unit_of_measurement: kW
+    device_class: power
+
+esp32_touch:
+
+binary_sensor:
+  - platform: esp32_touch
+    name: "ESP32 Touch Pad"
+    pin: GPIO27
+    threshold: 1000
+
+sensor:
+  - platform: homeassistant
+    name: "temperature sensor 1"
+    id: temp_1
+    device_class: temperature
+    entity_id: $temp_sensor1_id
+  - platform: homeassistant
+    name: "temperature sensor 2"
+    id: temp_2
+    device_class: temperature
+    entity_id: $temp_sensor2_id
+  - platform: template
+    name: "Power Factor"
+    id: powerfactor
+    state_class: measurement
+    accuracy_decimals: 2
+    lambda: |-
+      return id(powerfactor).state;
+    update_interval: 1s
+  - platform: template
+    name: "Current Boiler Power"
+    id: current_boiler_power
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 3
+    lambda: |-
+      return (id(powerfactor).state*id(max_power_rod).state);
+    unit_of_measurement: 'kW'
+    update_interval: 1s
+
+  #- platform: integration
+  #  name: "Total Consumption Heating Rod"
+  #  id: total_energy_heatingrod
+  #  sensor: powerfactor
+  #  time_unit: h
+  #  integration_method: trapezoid
+  #  device_class: energy
+  #  unit_of_measurement: kWh
+  #  state_class: total
+  #  filters:
+  #    - multiply: 0.001
+  #    - multiply: $max_power_rod
+
+  # read current power consumption: smartmeter reader via homeassistant api
+  # positive value: consumption, negative value: excess production
+  - platform: homeassistant
+    name: "Current Power Consumption"
+    id: current_power_consumption
+    device_class: power
+    entity_id: sensor.smartmeter_reader_esphome_current_power
+    filters:
+      #- throttle_average: 2s
+      - throttle: 1s  # alternative to test
+    on_value: 
+      then:
+        - if:
+            condition:
+              switch.is_on: coil_switch
+            then:
+              #- logger.log: "switch is on"
+              - if:
+                  condition:
+                    lambda: |-
+                      return (isnan(id(current_power_consumption).state));
+                  then:
+                    - logger.log: "No valid Smartmeter reading. Turning relay off"
+                    - script.execute: turn_off_ssr
+                  else: 
+                    - globals.set:
+                        id: last_updated
+                        value: !lambda |-
+                          return(id(homeassistant_time).now().timestamp);
+                    - if:
+                        condition:
+                          - sun.is_above_horizon:
+                        then:
+                          #- logger.log: "sun is above horizon"
+                          #- logger.log:
+                          #    format: "temp1 is %.0f °C and temp2 is %.0f °C"
+                          #    args: ["id(temp_1).state", "id(temp_2).state"]
+                          - if:
+                              condition:
+                                # check if max water temp is exceeded (redundant check: also guaranteed by coil thermostat):
+                                and:
+                                  - sensor.in_range:
+                                      id: temp_1
+                                      below: $temp_limit
+                                  - sensor.in_range:
+                                      id: temp_2
+                                      below: $temp_limit
+                              then:
+                                #- logger.log: "max water temp below limit, safety stop not active"
+                                # calculate pwm_level and set it
+                                - lambda: |-
+                                            if (id(current_power_consumption).state < -525){
+                                              id(pwm_lvl) += 6;
+                                            } else {
+                                                if (id(current_power_consumption).state < -375){
+                                                  id(pwm_lvl) += 4;
+                                                } else {
+                                                    if (id(current_power_consumption).state < -225){
+                                                      id(pwm_lvl) += 2;
+                                                    } else {
+                                                        if (id(current_power_consumption).state <= -140){
+                                                          id(pwm_lvl) += 1;
+                                                        } else {
+                                                            if(id(current_power_consumption).state > 1000){
+                                                                id(pwm_lvl) -= 16;
+                                                            } else {
+                                                                if(id(current_power_consumption).state > 700){
+                                                                  id(pwm_lvl) -= 12;
+                                                                } else {
+                                                                    if(id(current_power_consumption).state > 325){
+                                                                      id(pwm_lvl) -= 8;
+                                                                    } else {
+                                                                        if(id(current_power_consumption).state > 160){
+                                                                          id(pwm_lvl) -= 5;
+                                                                        } else {
+                                                                            if(id(current_power_consumption).state > 100){
+                                                                              id(pwm_lvl) -= 2;
+                                                                            } else {
+                                                                                if(id(current_power_consumption).state > -50){
+                                                                                  id(pwm_lvl) -= 1;
+                                                                                }
+                                                                              }
+                                                                          }
+                                                                      }
+                                                                  }
+                                                              }
+                                                          }
+                                                      }
+                                                  }
+                                              }
+                                            // 0 is min pwm_level, 20 max pwm_lvl @50Hz and 0.2s integration time
+                                            if (id(pwm_lvl) < 0) {
+                                              id(pwm_lvl) = 0;
+                                            } else if (id(pwm_lvl) > $levels) {
+                                              id(pwm_lvl) = $levels;
+                                            }
+                                            // calculate power factor and set relay control pwm
+                                            id(powerfactor).state = id(pwm_lvl) * $relative_step_size;
+                                            id(ssr_control).set_level(id(powerfactor).state);
+                                - logger.log: 
+                                    format: "powerfactor: %.2f"
+                                    args: ["id(powerfactor).state"]
+                              else:
+                                - logger.log: "max water temp above safety limit, turn off coil"
+                                - script.execute: turn_off_ssr
+                        else:
+                          - logger.log: "sun is below horizon, relay off"
+                          - script.execute: turn_off_ssr  # turn off (safety, partly redundant with sun.on_sunset)
+                          # entering sleep on event sun.on_sunset
+            else:  # redundant to turn_off event
+              - logger.log: "Switch is off. Turning relay off."
+              - script.execute: turn_off_ssr
+
+script:
+  - id: set_powerfactor
+    parameters: 
+      factor: float
+    then:
+      - lambda: |-
+                  id(powerfactor).state = factor;
+                  id(ssr_control).set_level(factor);
+  - id: turn_off_ssr
+    then:
+      - script.execute:
+          id: set_powerfactor
+          factor: 0
