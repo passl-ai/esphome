@@ -1,0 +1,15 @@
+# Local ESPHome secrets.
+secrets.yaml
+
+# ESPHome build/cache output.
+.esphome/
+*.ota.bin
+*.factory.bin
+*.elf
+*.map
+
+# Local editor/OS noise.
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
