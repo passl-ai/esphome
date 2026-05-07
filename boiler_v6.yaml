@@ -8,13 +8,13 @@ substitutions:
   time_limit_unchanged: '10'  # seconds without smartmeter updates before turning off rod
 
   # 50 Hz -> 50 full sinus waves -> 100 half waves = zero crossing on/off points per second.
-  # Smartmeter integration is assumed to be 5 Hz / 0.2 s -> 20 PWM levels -> 5% per step.
-  # example: total power of coil: 1.5kW -> 75W per step
-  levels: '20'
-  target_grid_power: '-50.0f'
-  deadband: '50.0f'
-  watts_per_pwm_level: '75.0f'
-  integration_time_meter: '0.2s'  # assumption, 5Hz
+  # At the default smartmeter integration frequency of 5 Hz / 0.2 s:
+  # 100 half waves / 5 Hz -> 20 PWM levels -> 5% per step.
+  # example: total power of coil: 1.5 kW -> 75 W per step.
+  mains_half_waves_per_second: '100.0f'  # 50 Hz frequency for full wave
+  default_smartmeter_integration_frequency: '5.0f'
+  default_target_grid_power: '-50.0f'
+  default_deadband: '50.0f'
   sleep_retry_interval: '15min'
   sleep_startup_grace_minutes: '15'
 
@@ -24,6 +24,7 @@ esphome:
   on_boot:
     priority: -10
     then:
+      - script.execute: apply_smartmeter_integration_settings
       - script.execute: turn_off_ssr
 
 esp32:
@@ -135,11 +136,28 @@ globals:
     restore_value: no
     initial_value: '0'
 
+    # Internal derived values. Home Assistant can only edit the input numbers above;
+    # these are recalculated from max_power_rod and smartmeter_integration_frequency.
+    # The initial values are boot fallbacks matching the defaults: 1.5 kW and 5 Hz.
+  - id: pwm_levels
+    type: int
+    restore_value: no
+    initial_value: '20'
+  - id: watts_per_pwm_level
+    type: float
+    restore_value: no
+    initial_value: '75.0f'
+  - id: integration_time_meter_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '200'
+
 output:
   - platform: slow_pwm
     pin: GPIO13
     id: ssr_control
-    period: $integration_time_meter
+    # Boot fallback. The HA-configurable smartmeter frequency is applied at runtime.
+    period: 200ms
 
 switch:
   - platform: output
@@ -171,8 +189,54 @@ number:
     min_value: 0.1
     step: 0.1
     optimistic: true
+    restore_value: true
     unit_of_measurement: kW
     device_class: power
+    on_value:
+      then:
+        - script.execute: apply_smartmeter_integration_settings
+  - platform: template
+    name: "Smartmeter Integration Frequency"
+    id: smartmeter_integration_frequency
+    initial_value: 5.0
+    max_value: 10.0
+    min_value: 1.0
+    step: 1.0
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: Hz
+    device_class: frequency
+    entity_category: config
+    mode: box
+    on_value:
+      then:
+        - script.execute: apply_smartmeter_integration_settings
+  - platform: template
+    name: "Target Grid Power"
+    id: target_grid_power
+    initial_value: -50.0
+    max_value: 50.0
+    min_value: -250.0
+    step: 10.0
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: W
+    device_class: power
+    entity_category: config
+    mode: box
+  - platform: template
+    name: "Grid Power Deadband"
+    id: grid_power_deadband
+    initial_value: 50.0
+    max_value: 200.0
+    min_value: 0.0
+    step: 10.0
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: W
+    device_class: power
+    entity_category: config
+    mode: box
 
 esp32_touch:
 
@@ -199,6 +263,37 @@ sensor:
     state_class: measurement
     accuracy_decimals: 2
     update_interval: never
+  - platform: template
+    name: "PWM Levels"
+    id: pwm_levels_sensor
+    state_class: measurement
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    lambda: |-
+      return id(pwm_levels);
+    update_interval: 1s
+  - platform: template
+    name: "Watts per PWM Level"
+    id: watts_per_pwm_level_sensor
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    unit_of_measurement: W
+    lambda: |-
+      return id(watts_per_pwm_level);
+    update_interval: 1s
+  - platform: template
+    name: "Smartmeter Integration Time"
+    id: smartmeter_integration_time
+    device_class: duration
+    state_class: measurement
+    accuracy_decimals: 3
+    entity_category: diagnostic
+    unit_of_measurement: s
+    lambda: |-
+      return id(integration_time_meter_ms) / 1000.0f;
+    update_interval: 1s
   - platform: template
     name: "Current Boiler Power"
     id: current_boiler_power
@@ -278,6 +373,50 @@ sensor:
                           # entering sleep on event sun.on_sunset
 
 script:
+  - id: apply_smartmeter_integration_settings
+    mode: restart
+    then:
+      - lambda: |-
+          float frequency = id(smartmeter_integration_frequency).state;
+          if (isnan(frequency) || frequency <= 0.0f) {
+            frequency = ${default_smartmeter_integration_frequency};
+          }
+
+          const uint32_t period_ms = (uint32_t) roundf(1000.0f / frequency);
+          int levels = (int) roundf(${mains_half_waves_per_second} / frequency);
+          if (levels < 1) {
+            levels = 1;
+          }
+
+          float max_power_kw = id(max_power_rod).state;
+          if (isnan(max_power_kw) || max_power_kw <= 0.0f) {
+            max_power_kw = 1.5f;
+          }
+
+          id(integration_time_meter_ms) = period_ms;
+          id(pwm_levels) = levels;
+          id(watts_per_pwm_level) = (max_power_kw * 1000.0f) / levels;
+          id(ssr_control).set_period(period_ms);
+          id(ssr_control).restart_cycle();
+
+          float factor = id(powerfactor).state;
+          if (isnan(factor) || factor < 0.0f) {
+            factor = 0.0f;
+          } else if (factor > 1.0f) {
+            factor = 1.0f;
+          }
+
+          id(pwm_lvl) = (int) roundf(factor * levels);
+          factor = id(pwm_lvl) / (float) levels;
+          id(powerfactor).publish_state(factor);
+          id(ssr_control).set_level(factor);
+      - logger.log:
+          format: "smartmeter integration: %.1f Hz, %.3f s, %d levels, %.1f W/level"
+          args:
+            - "id(smartmeter_integration_frequency).state"
+            - "id(integration_time_meter_ms) / 1000.0f"
+            - "id(pwm_levels)"
+            - "id(watts_per_pwm_level)"
   - id: try_enter_night_sleep
     mode: single
     then:
@@ -323,15 +462,31 @@ script:
       grid_power: float
     then:
       - lambda: |-
-          const float target_grid_power = ${target_grid_power};
-          const float deadband = ${deadband};
-          const float watts_per_pwm_level = ${watts_per_pwm_level};
+          float target = id(target_grid_power).state;
+          if (isnan(target)) {
+            target = ${default_target_grid_power};
+          }
+
+          float deadband = id(grid_power_deadband).state;
+          if (isnan(deadband) || deadband < 0.0f) {
+            deadband = ${default_deadband};
+          }
+
+          const int levels = id(pwm_levels);
+          const float watts_per_level = id(watts_per_pwm_level);
+          if (levels < 1 || isnan(watts_per_level) || watts_per_level <= 0.0f) {
+            id(pwm_lvl) = 0;
+            id(powerfactor).publish_state(0.0f);
+            id(ssr_control).set_level(0.0f);
+            return;
+          }
+
           int pwm_delta = 0;
-          const float target_offset = grid_power - target_grid_power;
+          const float target_offset = grid_power - target;
 
           if (target_offset > deadband) {
             const float watts_to_remove = target_offset - deadband;
-            pwm_delta = -((int) ceilf(watts_to_remove / watts_per_pwm_level));
+            pwm_delta = -((int) ceilf(watts_to_remove / watts_per_level));
 
             if (grid_power > 500.0f) {
               pwm_delta -= 2;
@@ -339,31 +494,35 @@ script:
             if (grid_power > 1000.0f) {
               pwm_delta -= 2;
             }
-            if (pwm_delta < -20) {
-              pwm_delta = -20;
+            if (pwm_delta < -levels) {
+              pwm_delta = -levels;
             }
           } else if (target_offset < -deadband) {
             const float surplus_to_use = -target_offset - deadband;
-            pwm_delta = (int) ceilf(surplus_to_use / (2.0f * watts_per_pwm_level));
+            pwm_delta = (int) ceilf(surplus_to_use / (2.0f * watts_per_level));
 
-            if (pwm_delta > 6) {
-              pwm_delta = 6;
+            int max_positive_delta = (int) ceilf(levels * 0.3f);
+            if (max_positive_delta < 1) {
+              max_positive_delta = 1;
+            }
+            if (pwm_delta > max_positive_delta) {
+              pwm_delta = max_positive_delta;
             }
           }
 
           id(pwm_lvl) += pwm_delta;
           if (id(pwm_lvl) < 0) {
             id(pwm_lvl) = 0;
-          } else if (id(pwm_lvl) > $levels) {
-            id(pwm_lvl) = $levels;
+          } else if (id(pwm_lvl) > levels) {
+            id(pwm_lvl) = levels;
           }
 
-          const float factor = id(pwm_lvl) / (float) $levels;
+          const float factor = id(pwm_lvl) / (float) levels;
           id(powerfactor).publish_state(factor);
           id(ssr_control).set_level(factor);
       - logger.log:
-          format: "grid: %.0f W, pwm level: %d/$levels, powerfactor: %.2f"
-          args: ["grid_power", "id(pwm_lvl)", "id(powerfactor).state"]
+          format: "grid: %.0f W, pwm level: %d/%d, powerfactor: %.2f"
+          args: ["grid_power", "id(pwm_lvl)", "id(pwm_levels)", "id(powerfactor).state"]
   - id: set_powerfactor
     parameters:
       factor: float
@@ -375,7 +534,7 @@ script:
             factor = 1.0f;
           }
 
-          id(pwm_lvl) = (int) roundf(factor * $levels);
+          id(pwm_lvl) = (int) roundf(factor * id(pwm_levels));
           id(powerfactor).publish_state(factor);
           id(ssr_control).set_level(factor);
   - id: turn_off_ssr
