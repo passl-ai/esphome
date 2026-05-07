@@ -245,6 +245,10 @@ binary_sensor:
     name: "ESP32 Touch Pad"
     pin: GPIO27
     threshold: 1000
+  - platform: status
+    name: "ESP32 Status"
+    id: esp32_status
+    entity_category: diagnostic
 
 sensor:
   - platform: homeassistant
