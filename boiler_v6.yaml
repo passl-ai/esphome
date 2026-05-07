@@ -11,6 +11,9 @@ substitutions:
   # Smartmeter integration is assumed to be 5 Hz / 0.2 s -> 20 PWM levels -> 5% per step.
   # example: total power of coil: 1.5kW -> 75W per step
   levels: '20'
+  target_grid_power: '-50.0f'
+  deadband: '50.0f'
+  watts_per_pwm_level: '75.0f'
   integration_time_meter: '0.2s'  # assumption, 5Hz
   sleep_retry_interval: '15min'
   sleep_startup_grace_minutes: '15'
@@ -320,34 +323,32 @@ script:
       grid_power: float
     then:
       - lambda: |-
+          const float target_grid_power = ${target_grid_power};
+          const float deadband = ${deadband};
+          const float watts_per_pwm_level = ${watts_per_pwm_level};
           int pwm_delta = 0;
+          const float target_offset = grid_power - target_grid_power;
 
-          if (grid_power < -525.0f) {
-            pwm_delta = 6;
-          } else if (grid_power < -375.0f) {
-            pwm_delta = 4;
-          } else if (grid_power < -225.0f) {
-            pwm_delta = 2;
-          } else if (grid_power < -150.0f) {
-            pwm_delta = 1;
-          } else if (grid_power > 1200.0f) {
-            pwm_delta = -19;
-          } else if (grid_power > 1000.0f) {
-            pwm_delta = -16;
-          } else if (grid_power > 700.0f) {
-            pwm_delta = -14;
-          } else if (grid_power > 500.0f) {
-            pwm_delta = -10;
-          } else if (grid_power > 350.0f) {
-            pwm_delta = -8;
-          } else if (grid_power > 160.0f) {
-            pwm_delta = -6;
-          } else if (grid_power > 120.0f) {
-            pwm_delta = -3;
-          } else if (grid_power > 75.0f) {
-            pwm_delta = -2;
-          } else if (grid_power > -50.0f) {
-            pwm_delta = -1;
+          if (target_offset > deadband) {
+            const float watts_to_remove = target_offset - deadband;
+            pwm_delta = -((int) ceilf(watts_to_remove / watts_per_pwm_level));
+
+            if (grid_power > 500.0f) {
+              pwm_delta -= 2;
+            }
+            if (grid_power > 1000.0f) {
+              pwm_delta -= 2;
+            }
+            if (pwm_delta < -20) {
+              pwm_delta = -20;
+            }
+          } else if (target_offset < -deadband) {
+            const float surplus_to_use = -target_offset - deadband;
+            pwm_delta = (int) ceilf(surplus_to_use / (2.0f * watts_per_pwm_level));
+
+            if (pwm_delta > 6) {
+              pwm_delta = 6;
+            }
           }
 
           id(pwm_lvl) += pwm_delta;
