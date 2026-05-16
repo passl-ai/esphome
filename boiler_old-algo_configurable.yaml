@@ -1,0 +1,526 @@
+substitutions:
+  # Home Assistant temperature sensor entity ids.
+  heating_ip: !secret heating_ip
+  temp_sensor1_id: sensor.eta_${heating_ip}_pufferflex_eingange_fuhler_1_oben
+  temp_sensor2_id: sensor.eta_${heating_ip}_pufferflex_eingange_fuhler_2
+
+  temp_limit: '85'  # deg C
+  time_limit_unchanged: '10'  # seconds without smartmeter updates before turning off rod
+
+  # 50 Hz -> 50 full sinus waves -> 100 half waves = zero crossing on/off points per second.
+  # At the default smartmeter integration frequency of 5 Hz / 0.2 s:
+  # 100 half waves / 5 Hz -> 20 PWM levels -> 5% per step.
+  # example: total power of coil: 1.5 kW -> 75 W per step.
+  mains_half_waves_per_second: '100.0f'  # 50 Hz frequency for full wave
+  default_smartmeter_integration_frequency: '5.0f'
+  default_target_grid_power: '-50.0f'
+  default_deadband: '50.0f'
+  sleep_retry_interval: '15min'
+  sleep_startup_grace_minutes: '15'
+
+esphome:
+  name: diff-boiler
+  friendly_name: diff_boiler
+  on_boot:
+    priority: -10
+    then:
+      - script.execute: apply_smartmeter_integration_settings
+      - script.execute: turn_off_ssr
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret enc_key_boiler
+
+ota:
+  platform: esphome
+  password: !secret ota_pw_boiler
+
+wifi:
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+      manual_ip:
+        static_ip: !secret static_ip_boiler
+        gateway: !secret gateway
+        subnet: 255.255.255.0
+    #- ssid: !secret wifi_ssid_ext
+    #  password: !secret wifi_password_ext
+    #  manual_ip:
+    #    static_ip: !secret static_ip_boiler_ext
+    #    gateway: !secret gateway_ext
+    #    subnet: 255.255.255.0
+
+  on_connect:
+    - logger.log: "wifi connected"
+  on_disconnect:
+    - logger.log: "wifi disconnected, turning relay off"
+    - script.execute: turn_off_ssr
+
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+
+    on_time_sync:
+      then:
+        - logger.log:
+            format: "time is %d"
+            args: ["id(homeassistant_time).now().timestamp"]
+
+    # Check every $time_limit_unchanged seconds whether the smartmeter reader is still updating.
+    on_time:
+      - seconds: /$time_limit_unchanged
+        then:
+          - if:
+              condition:
+                and:
+                  - switch.is_on: coil_switch
+                  - not:
+                      time.has_time:
+              then:
+                - logger.log: "Time is not valid. Turning relay off."
+                - script.execute: turn_off_ssr
+          - if:
+              condition:
+                and:
+                  - switch.is_on: coil_switch
+                  - time.has_time:
+                  - lambda: |-
+                      return id(homeassistant_time).now().timestamp - id(last_updated) > $time_limit_unchanged;
+              then:
+                - script.execute: turn_off_ssr
+                - logger.log: "Turned off due to smartmeter reading not changing for $time_limit_unchanged s. Will resume..."
+
+deep_sleep:
+  id: deep_sleep_1
+  touch_wakeup: true
+
+sun:
+  id: sun_component
+  latitude: !secret latitude
+  longitude: !secret longitude
+  on_sunset:
+    then:
+      - script.execute: turn_off_ssr
+      - logger.log: "sunset"
+      - script.execute: try_enter_night_sleep
+
+interval:
+  - interval: $sleep_retry_interval
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: deepsleep_switch
+              - sun.is_below_horizon:
+          then:
+            - script.execute: try_enter_night_sleep
+globals:
+  - id: pwm_lvl
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_updated
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: night_sleep_duration_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+    # Internal derived values. Home Assistant can only edit the input numbers above;
+    # these are recalculated from max_power_rod and smartmeter_integration_frequency.
+    # The initial values are boot fallbacks matching the defaults: 1.5 kW and 5 Hz.
+  - id: pwm_levels
+    type: int
+    restore_value: no
+    initial_value: '20'
+  - id: watts_per_pwm_level
+    type: float
+    restore_value: no
+    initial_value: '75.0f'
+  - id: integration_time_meter_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '200'
+
+output:
+  - platform: slow_pwm
+    pin: GPIO13
+    id: ssr_control
+    # Boot fallback. The HA-configurable smartmeter frequency is applied at runtime.
+    period: 200ms
+
+switch:
+  - platform: output
+    name: "Heizstab an"
+    id: coil_switch
+    icon: "mdi:radiator"
+    output: ssr_control
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      then:
+        - script.execute: turn_off_ssr #name misleading but resets to avoid voltage peak
+    on_turn_off:
+      then:
+        - script.execute: turn_off_ssr #resets to avoid voltage peak
+  - platform: template
+    name: "DeepSleep in der Nacht"
+    id: deepsleep_switch
+    icon: "mdi:power-sleep"
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+
+number:
+  # Max power rod is used for Home Assistant consumption integration.
+  - platform: template
+    name: "Max. Power Rod"
+    id: max_power_rod
+    initial_value: 1.5
+    max_value: 3.0
+    min_value: 0.1
+    step: 0.1
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: kW
+    device_class: power
+    on_value:
+      then:
+        - script.execute: apply_smartmeter_integration_settings
+  - platform: template
+    name: "Smartmeter Integration Frequency"
+    id: smartmeter_integration_frequency
+    initial_value: 5.0
+    max_value: 10.0
+    min_value: 1.0
+    step: 1.0
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: Hz
+    device_class: frequency
+    entity_category: config
+    mode: box
+    on_value:
+      then:
+        - script.execute: apply_smartmeter_integration_settings
+  - platform: template
+    name: "Target Grid Power"
+    id: target_grid_power
+    initial_value: -50.0
+    max_value: 50.0
+    min_value: -250.0
+    step: 10.0
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: W
+    device_class: power
+    entity_category: config
+    mode: box
+  - platform: template
+    name: "Grid Power Deadband"
+    id: grid_power_deadband
+    initial_value: 50.0
+    max_value: 200.0
+    min_value: 0.0
+    step: 10.0
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: W
+    device_class: power
+    entity_category: config
+    mode: box
+
+esp32_touch:
+
+binary_sensor:
+  - platform: esp32_touch
+    name: "ESP32 Touch Pad"
+    pin: GPIO27
+    threshold: 1000
+
+sensor:
+  - platform: homeassistant
+    name: "temperature sensor 1"
+    id: temp_1
+    device_class: temperature
+    entity_id: $temp_sensor1_id
+  - platform: homeassistant
+    name: "temperature sensor 2"
+    id: temp_2
+    device_class: temperature
+    entity_id: $temp_sensor2_id
+  - platform: template
+    name: "Power Factor"
+    id: powerfactor
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+  - platform: template
+    name: "PWM Levels"
+    id: pwm_levels_sensor
+    state_class: measurement
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    lambda: |-
+      return id(pwm_levels);
+    update_interval: 1s
+  - platform: template
+    name: "Watts per PWM Level"
+    id: watts_per_pwm_level_sensor
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    unit_of_measurement: W
+    lambda: |-
+      return id(watts_per_pwm_level);
+    update_interval: 1s
+  - platform: template
+    name: "Smartmeter Integration Time"
+    id: smartmeter_integration_time
+    device_class: duration
+    state_class: measurement
+    accuracy_decimals: 3
+    entity_category: diagnostic
+    unit_of_measurement: s
+    lambda: |-
+      return id(integration_time_meter_ms) / 1000.0f;
+    update_interval: 1s
+  - platform: template
+    name: "Current Boiler Power"
+    id: current_boiler_power
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 3
+    lambda: |-
+      if (isnan(id(powerfactor).state) || isnan(id(max_power_rod).state)) {
+        return 0.0f;
+      }
+      return id(powerfactor).state * id(max_power_rod).state;
+    unit_of_measurement: 'kW'
+    update_interval: 1s
+
+  #- platform: integration
+  #  name: "Total Consumption Heating Rod"
+  #  id: total_energy_heatingrod
+  #  sensor: current_boiler_power
+  #  time_unit: h
+  #  integration_method: trapezoid
+  #  device_class: energy
+  #  unit_of_measurement: kWh
+  #  state_class: total
+
+  # Read current grid power via Home Assistant smartmeter reader.
+  # Positive value: consumption, negative value: excess production.
+  - platform: homeassistant
+    name: "Current Power Consumption"
+    id: current_power_consumption
+    device_class: power
+    entity_id: sensor.smartmeter_reader_esphome_current_power
+    filters:
+      - throttle: 1s
+    on_value:
+      then:
+        - if:
+            condition:
+              switch.is_on: coil_switch
+            then:
+              - if:
+                  condition:
+                    lambda: |-
+                      return isnan(id(current_power_consumption).state);
+                  then:
+                    - logger.log: "No valid smartmeter reading. Turning relay off"
+                    - script.execute: turn_off_ssr
+                  else:
+                    - globals.set:
+                        id: last_updated
+                        value: !lambda |-
+                          return id(homeassistant_time).now().timestamp;
+                    - if:
+                        condition:
+                          sun.is_above_horizon:
+                        then:
+                          - if:
+                              condition:
+                                # Redundant safety check: the coil hardware thermostat should also cap the temperature.
+                                and:
+                                  - sensor.in_range:
+                                      id: temp_1
+                                      below: $temp_limit
+                                  - sensor.in_range:
+                                      id: temp_2
+                                      below: $temp_limit
+                              then:
+                                - script.execute:
+                                    id: calculate_new_powerfactor
+                                    grid_power: !lambda |-
+                                      return id(current_power_consumption).state;
+                              else:
+                                - logger.log: "max water temp above safety limit, turn off coil"
+                                - script.execute: turn_off_ssr
+                        else:
+                          - logger.log: "sun is below horizon, relay off"
+                          - script.execute: turn_off_ssr  # turn off (safety, partly redundant with sun.on_sunset)
+                          # entering sleep on event sun.on_sunset
+
+script:
+  - id: apply_smartmeter_integration_settings
+    mode: restart
+    then:
+      - lambda: |-
+          float frequency = id(smartmeter_integration_frequency).state;
+          if (isnan(frequency) || frequency <= 0.0f) {
+            frequency = ${default_smartmeter_integration_frequency};
+          }
+
+          const uint32_t period_ms = (uint32_t) roundf(1000.0f / frequency);
+          int levels = (int) roundf(${mains_half_waves_per_second} / frequency);
+          if (levels < 1) {
+            levels = 1;
+          }
+
+          float max_power_kw = id(max_power_rod).state;
+          if (isnan(max_power_kw) || max_power_kw <= 0.0f) {
+            max_power_kw = 1.5f;
+          }
+
+          id(integration_time_meter_ms) = period_ms;
+          id(pwm_levels) = levels;
+          id(watts_per_pwm_level) = (max_power_kw * 1000.0f) / levels;
+          id(ssr_control).set_period(period_ms);
+          id(ssr_control).restart_cycle();
+
+          float factor = id(powerfactor).state;
+          if (isnan(factor) || factor < 0.0f) {
+            factor = 0.0f;
+          } else if (factor > 1.0f) {
+            factor = 1.0f;
+          }
+
+          id(pwm_lvl) = (int) roundf(factor * levels);
+          factor = id(pwm_lvl) / (float) levels;
+          id(powerfactor).publish_state(factor);
+          id(ssr_control).set_level(factor);
+      - logger.log:
+          format: "smartmeter integration: %.1f Hz, %.3f s, %d levels, %.1f W/level"
+          args:
+            - "id(smartmeter_integration_frequency).state"
+            - "id(integration_time_meter_ms) / 1000.0f"
+            - "id(pwm_levels)"
+            - "id(watts_per_pwm_level)"
+  - id: try_enter_night_sleep
+    mode: single
+    then:
+      - if:
+          condition:
+            switch.is_on: deepsleep_switch
+          then:
+            - logger.log: "deepsleep switch is on"
+            - if:
+                condition:
+                  lambda: |-
+                    return millis() >= $sleep_startup_grace_minutes * 60UL * 1000UL;
+                then:
+                  - if:
+                      condition:
+                        lambda: |-
+                          auto now = id(homeassistant_time).now();
+                          auto next_sunrise = id(sun_component).sunrise(0);
+                          if (!now.is_valid() || !next_sunrise.has_value()) {
+                            return false;
+                          }
+
+                          int32_t sleep_seconds = next_sunrise.value().timestamp - now.timestamp;
+                          if (sleep_seconds <= 0) {
+                            sleep_seconds += 24 * 60 * 60;
+                          }
+
+                          id(night_sleep_duration_ms) = (uint32_t) sleep_seconds * 1000UL;
+                          return true;
+                      then:
+                        - logger.log: "DeepSleep switch is on, time is valid. Going to sleep."
+                        - deep_sleep.enter:
+                            id: deep_sleep_1
+                            sleep_duration: !lambda |-
+                              return id(night_sleep_duration_ms);
+                      else:
+                        - logger.log: "Time is invalid or next sunrise could not be calculated. Staying awake."
+          
+                else:
+                  - logger.log: "Startup grace period active. Staying awake for $sleep_startup_grace_minutes min after restart."
+  - id: calculate_new_powerfactor
+    parameters:
+      grid_power: float
+    then:
+      - lambda: |-
+          int pwm_delta = 0;
+
+          if (grid_power < -525.0f) {
+            pwm_delta = 6;
+          } else if (grid_power < -375.0f) {
+            pwm_delta = 4;
+          } else if (grid_power < -225.0f) {
+            pwm_delta = 2;
+          } else if (grid_power < -150.0f) {
+            pwm_delta = 1;
+          } else if (grid_power > 1200.0f) {
+            pwm_delta = -19;
+          } else if (grid_power > 1000.0f) {
+            pwm_delta = -16;
+          } else if (grid_power > 700.0f) {
+            pwm_delta = -14;
+          } else if (grid_power > 500.0f) {
+            pwm_delta = -10;
+          } else if (grid_power > 350.0f) {
+            pwm_delta = -8;
+          } else if (grid_power > 160.0f) {
+            pwm_delta = -6;
+          } else if (grid_power > 120.0f) {
+            pwm_delta = -3;
+          } else if (grid_power > 75.0f) {
+            pwm_delta = -2;
+          } else if (grid_power > -50.0f) {
+            pwm_delta = -1;
+          }
+
+          id(pwm_lvl) += pwm_delta;
+          if (id(pwm_lvl) < 0) {
+            id(pwm_lvl) = 0;
+          } else if (id(pwm_lvl) > id(pwm_levels)) {
+            id(pwm_lvl) = id(pwm_levels);
+          }
+
+          const float factor = id(pwm_lvl) / (float) id(pwm_levels);
+          id(powerfactor).publish_state(factor);
+          id(ssr_control).set_level(factor);
+      - logger.log:
+          format: "grid: %.0f W, pwm level: %d/%d, powerfactor: %.2f"
+          args: ["grid_power", "id(pwm_lvl)", "id(pwm_levels)", "id(powerfactor).state"]
+  - id: set_powerfactor
+    parameters:
+      factor: float
+    then:
+      - lambda: |-
+          if (factor < 0.0f || isnan(factor)) {
+            factor = 0.0f;
+          } else if (factor > 1.0f) {
+            factor = 1.0f;
+          }
+
+          id(pwm_lvl) = (int) roundf(factor * id(pwm_levels));
+          id(powerfactor).publish_state(factor);
+          id(ssr_control).set_level(factor);
+  - id: turn_off_ssr
+    then:
+      - script.execute:
+          id: set_powerfactor
+          factor: 0
