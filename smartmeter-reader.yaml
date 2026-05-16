@@ -10,6 +10,7 @@ esp32:
 logger:
   # Keep hardware UART free for the SML meter on GPIO3.
   baud_rate: 0
+  level: INFO
 
 api:
   encryption:
